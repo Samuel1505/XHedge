@@ -2,7 +2,7 @@
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, Env};
 
 fn setup_test_env() -> (Env, VolatilityShieldClient<'static>, Address, Address) {
     let env = Env::default();
@@ -86,10 +86,7 @@ proptest! {
         let treasury = Address::generate(&env);
         
         let token_admin = Address::generate(&env);
-        let (token_id, stellar_asset_client, _token_client) = {
-            let contract_id = env.register_stellar_asset_contract_v2(token_admin.clone());
-            (contract_id.address(), StellarAssetClient::new(&env, &contract_id.address()), TokenClient::new(&env, &contract_id.address()))
-        };
+        let (token_id, stellar_asset_client, _token_client) = create_token_contract(&env, &token_admin);
 
         let guardians = soroban_sdk::vec![&env, admin.clone()];
         client.init(&admin, &token_id, &oracle, &treasury, &0u32, &guardians, &1u32);

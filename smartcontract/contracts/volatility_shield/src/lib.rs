@@ -156,7 +156,10 @@ pub struct VolatilityShield;
 
 #[contractimpl]
 impl VolatilityShield {
-    // ── Governance ────────────────────────────
+    /// Propose a new governance action.
+    ///
+    /// This is the first step in the multisig/timelock process.
+    /// Only guardians can propose actions.
     pub fn propose_action(env: Env, proposer: Address, action: ActionType) -> Result<u64, Error> {
         proposer.require_auth();
 
@@ -220,6 +223,10 @@ impl VolatilityShield {
         Ok(id)
     }
 
+    /// Approve a pending governance proposal.
+    ///
+    /// If the approval threshold is reached, the action is executed.
+    /// Guardians cannot approve the same proposal twice.
     pub fn approve_action(env: Env, guardian: Address, proposal_id: u64) -> Result<(), Error> {
         guardian.require_auth();
 
@@ -267,6 +274,8 @@ impl VolatilityShield {
         Ok(())
     }
 
+    /// Add a new guardian to the multisig.
+    /// Only the admin can call this.
     pub fn add_guardian(env: Env, guardian: Address) -> Result<(), Error> {
         Self::require_admin(&env);
         let mut guardians: Vec<Address> = env
@@ -284,6 +293,8 @@ impl VolatilityShield {
         Ok(())
     }
 
+    /// Remove an existing guardian.
+    /// Only the admin can call this.
     pub fn remove_guardian(env: Env, guardian: Address) -> Result<(), Error> {
         Self::require_admin(&env);
         let mut guardians: Vec<Address> = env
@@ -301,6 +312,8 @@ impl VolatilityShield {
         Ok(())
     }
 
+    /// Set the required number of approvals for executing proposals.
+    /// Only the admin can call this. Must be <= number of guardians.
     pub fn set_threshold(env: Env, threshold: u32) -> Result<(), Error> {
         Self::require_admin(&env);
         let guardians: Vec<Address> = env
@@ -354,7 +367,7 @@ impl VolatilityShield {
         }
 
         let now = env.ledger().timestamp();
-        let elapsed = now.checked_sub(proposed_at).unwrap_or(0);
+        let elapsed = now.saturating_sub(proposed_at);
 
         if elapsed < timelock_duration {
             return Err(Error::TimelockNotElapsed);
@@ -364,7 +377,17 @@ impl VolatilityShield {
     }
 
     // ── Initialization ────────────────────────
-    /// Must be called once. Stores roles and configuration.
+    /// Initialize the contract state.
+    ///
+    /// This function can only be called once.
+    /// @param admin The address with administrative privileges.
+    /// @param asset The address of the asset being managed (e.g., USDC).
+    /// @param oracle The address of the oracle provider.
+    /// @param treasury The address where fees are collected.
+    /// @param fee_percentage The management fee in basis points (1/10000).
+    /// @param guardians A list of addresses for the multisig governance.
+    /// @param threshold The number of approvals required for governance actions.
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         env: Env,
         admin: Address,
@@ -410,15 +433,15 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::Threshold, &threshold);
 
-        // Initialize contract version
-        env.storage()
-            .instance()
-            .set(&DataKey::ContractVersion, &1u32);
-
         Ok(())
     }
 
     // ── Deposit ───────────────────────────────
+    /// Deposit assets into the vault.
+    ///
+    /// The user will receive shares in return, proportional to the current share price.
+    /// @param from The address of the user depositing.
+    /// @param amount The amount of assets to deposit.
     pub fn deposit(env: Env, from: Address, amount: i128) {
         Self::check_version(&env, 1);
         Self::assert_not_paused(&env);
@@ -497,6 +520,12 @@ impl VolatilityShield {
     }
 
     // ── Withdraw ──────────────────────────────
+    /// Withdraw assets from the vault.
+    ///
+    /// The user burns shares and receives a proportional amount of assets.
+    /// If the withdrawal amount exceeds the queue threshold, it is queued instead.
+    /// @param from The address of the user withdrawing.
+    /// @param shares The amount of shares to burn.
     pub fn withdraw(env: Env, from: Address, shares: i128) {
         Self::check_version(&env, 1);
         Self::assert_not_paused(&env);
@@ -544,28 +573,15 @@ impl VolatilityShield {
         let total_shares = Self::total_shares(&env);
         let total_assets = Self::total_assets(&env);
 
-        Self::set_total_shares(env.clone(), total_shares.checked_sub(shares).unwrap());
-        Self::set_total_assets(
-            env.clone(),
-            total_assets.checked_sub(assets_to_withdraw).unwrap(),
-        );
-        env.storage().persistent().set(
-            &balance_key,
-            &(current_balance.checked_sub(shares).unwrap()),
-        );
-
-        let total_shares = Self::total_shares(&env);
-        let total_assets = Self::total_assets(&env);
-
         let new_total_shares = total_shares.checked_sub(shares).unwrap();
         let new_total_assets = total_assets.checked_sub(assets_to_withdraw).unwrap();
+        let new_user_balance = current_balance.checked_sub(shares).unwrap();
 
         Self::set_total_shares(env.clone(), new_total_shares);
         Self::set_total_assets(env.clone(), new_total_assets);
-        env.storage().persistent().set(
-            &balance_key,
-            &(current_balance.checked_sub(shares).unwrap()),
-        );
+        env.storage()
+            .persistent()
+            .set(&balance_key, &new_user_balance);
 
         let share_price = Self::get_share_price(&env);
 
@@ -591,9 +607,11 @@ impl VolatilityShield {
         );
     }
 
-    // ── Withdrawal Queue ───────────────────────
     /// Queue a withdrawal request for processing later.
+    ///
     /// This is called automatically by withdraw() when the amount exceeds the threshold.
+    /// @param from The address of the user withdrawing.
+    /// @param shares The amount of shares to burn.
     pub fn queue_withdraw(env: Env, from: Address, shares: i128) {
         Self::assert_not_paused(&env);
         if shares <= 0 {
@@ -656,8 +674,10 @@ impl VolatilityShield {
         );
     }
 
-    // ── Withdraw Queue Management ─────────────────────
-    /// Set the threshold for queuing withdrawals
+    /// Set the threshold for queuing withdrawals.
+    ///
+    /// Withdrawals larger than this amount will be queued for admin processing.
+    /// Only the admin can call this.
     pub fn set_withdraw_queue_threshold(env: Env, threshold: i128) {
         Self::require_admin(&env);
         if threshold < 0 {
@@ -672,7 +692,11 @@ impl VolatilityShield {
         );
     }
 
-    /// Process queued withdrawals (admin only)
+    /// Process a batch of queued withdrawals.
+    ///
+    /// The admin processes pending withdrawals in FIFO order up to the specified limit.
+    /// @param limit The maximum number of withdrawals to process.
+    /// @return The number of withdrawals actually processed.
     pub fn process_queued_withdrawals(env: Env, limit: u32) -> u32 {
         Self::require_admin(&env);
 
@@ -736,7 +760,9 @@ impl VolatilityShield {
         processed
     }
 
-    /// Cancel a queued withdrawal
+    /// Cancel a queued withdrawal and return shares to the user.
+    ///
+    /// @param from The address of the user whose withdrawal is being cancelled.
     pub fn cancel_queued_withdrawal(env: Env, from: Address) -> Result<(), Error> {
         from.require_auth();
 
@@ -815,7 +841,7 @@ impl VolatilityShield {
         let oracle = Self::get_oracle(env);
 
         // OR-auth: require that either Admin or Oracle authorised this invocation.
-        Self::require_admin_or_oracle(&env, &admin, &oracle);
+        Self::require_admin_or_oracle(env, &admin, &oracle);
 
         let now = env.ledger().timestamp();
         let last_update = env
@@ -823,11 +849,11 @@ impl VolatilityShield {
             .instance()
             .get(&DataKey::OracleLastUpdate)
             .unwrap_or(0u64);
-        let max_staleness = Self::max_staleness(&env);
+        let max_staleness = Self::max_staleness(env);
 
-        if now > last_update.checked_add(max_staleness).unwrap_or(u64::MAX) {
+        if now > last_update.saturating_add(max_staleness) {
             env.events().publish(
-                (soroban_sdk::Symbol::new(&env, "OracleStale"),),
+                (soroban_sdk::Symbol::new(env, "OracleStale"),),
                 last_update,
             );
             return Err(Error::StaleOracleData);
@@ -1010,6 +1036,7 @@ impl VolatilityShield {
         Ok(())
     }
 
+    /// Calculate the difference between current and target balances.
     pub fn calc_rebalance_delta(current: i128, target: i128) -> i128 {
         target
             .checked_sub(current)
@@ -1042,6 +1069,9 @@ impl VolatilityShield {
         Ok(())
     }
 
+    /// Harvest yields from all strategies and move them to the treasury.
+    ///
+    /// @return The total amount of yield harvested.
     pub fn harvest(env: Env) -> Result<i128, Error> {
         Self::check_version(&env, 1);
         Self::require_admin(&env);
@@ -1076,7 +1106,10 @@ impl VolatilityShield {
     }
 
     // ── Strategy Health Monitoring ───────────────────
-    /// Check health of all strategies and compare expected vs actual balances
+    /// Check the health of all registered strategies.
+    ///
+    /// Strategies are considered unhealthy if their actual balance deviates significantly from the expected balance.
+    /// @return A list of addresses for strategies detected as unhealthy.
     pub fn check_strategy_health(env: Env) -> Result<Vec<Address>, Error> {
         Self::require_admin(&env);
 
@@ -1154,7 +1187,10 @@ impl VolatilityShield {
         Ok(unhealthy_strategies)
     }
 
-    /// Flag a strategy as unhealthy (admin only)
+    /// Manually flag a strategy as unhealthy.
+    ///
+    /// Only the admin can call this.
+    /// @param strategy The address of the strategy to flag.
     pub fn flag_strategy(env: Env, strategy: Address) -> Result<(), Error> {
         Self::require_admin(&env);
 
@@ -1185,7 +1221,10 @@ impl VolatilityShield {
         Ok(())
     }
 
-    /// Remove a strategy and withdraw all funds first (admin only)
+    /// Remove a strategy from the vault and withdraw all funds from it.
+    ///
+    /// Only the admin can call this.
+    /// @param strategy The address of the strategy to remove.
     pub fn remove_strategy(env: Env, strategy: Address) -> Result<(), Error> {
         Self::require_admin(&env);
 
@@ -1243,7 +1282,7 @@ impl VolatilityShield {
         Ok(())
     }
 
-    /// Get health information for a specific strategy
+    /// Get health information for a specific strategy.
     pub fn get_strategy_health(env: Env, strategy: Address) -> Option<StrategyHealth> {
         env.storage()
             .instance()
@@ -1263,6 +1302,7 @@ impl VolatilityShield {
     }
 
     /// Total assets managed by the vault: vault token balance + sum of strategy balances.
+    /// Get the total assets managed by the vault (cash + strategy balances).
     pub fn total_assets(env: &Env) -> i128 {
         env.storage()
             .instance()
@@ -1270,6 +1310,7 @@ impl VolatilityShield {
             .unwrap_or(0)
     }
 
+    /// Get the total number of vault shares in circulation.
     pub fn total_shares(env: &Env) -> i128 {
         env.storage()
             .instance()
@@ -1277,6 +1318,7 @@ impl VolatilityShield {
             .unwrap_or(0)
     }
 
+    /// Get the address of the price oracle.
     pub fn get_oracle(env: &Env) -> Address {
         env.storage()
             .instance()
@@ -1284,6 +1326,7 @@ impl VolatilityShield {
             .expect("Not initialized")
     }
 
+    /// Get the address of the underlying asset (e.g., USDC).
     pub fn get_asset(env: &Env) -> Address {
         env.storage()
             .instance()
@@ -1291,6 +1334,7 @@ impl VolatilityShield {
             .expect("Not initialized")
     }
 
+    /// Get the list of all registered strategy addresses.
     pub fn get_strategies(env: &Env) -> Vec<Address> {
         env.storage()
             .instance()
@@ -1298,6 +1342,7 @@ impl VolatilityShield {
             .unwrap_or(Vec::new(env))
     }
 
+    /// Get the address of the fee treasury.
     pub fn treasury(env: &Env) -> Address {
         env.storage()
             .instance()
@@ -1305,6 +1350,7 @@ impl VolatilityShield {
             .expect("Not initialized")
     }
 
+    /// Get the management fee percentage in basis points.
     pub fn fee_percentage(env: &Env) -> u32 {
         env.storage()
             .instance()
@@ -1312,6 +1358,7 @@ impl VolatilityShield {
             .unwrap_or(0)
     }
 
+    /// Get the share balance of a specific user.
     pub fn balance(env: Env, user: Address) -> i128 {
         env.storage()
             .persistent()
@@ -1319,6 +1366,7 @@ impl VolatilityShield {
             .unwrap_or(0)
     }
 
+    /// Get the list of all guardians in the multisig governance.
     pub fn get_guardians(env: Env) -> Vec<Address> {
         env.storage()
             .instance()
@@ -1326,6 +1374,7 @@ impl VolatilityShield {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Get the required number of approvals for governance actions.
     pub fn get_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
