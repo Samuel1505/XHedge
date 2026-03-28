@@ -55,7 +55,7 @@ proptest! {
 
     #[test]
     fn test_conversion_invariants(amount in 1i128..1_000_000_000i128) {
-        let (env, client, _admin, _asset) = setup_test_env();
+        let (_env, client, _admin, _asset) = setup_test_env();
         
         // Initial state
         assert_eq!(client.convert_to_shares(&amount), amount);
