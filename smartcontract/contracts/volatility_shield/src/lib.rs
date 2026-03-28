@@ -157,12 +157,12 @@ pub struct VolatilityShield;
 #[contractimpl]
 impl VolatilityShield {
     // ── Governance ────────────────────────────
-    pub fn propose_action(env: Env, proposer: Address, action: ActionType) -> u64 {
+    pub fn propose_action(env: Env, proposer: Address, action: ActionType) -> Result<u64, Error> {
         proposer.require_auth();
 
         let guardians: Vec<Address> = env.storage().instance().get(&DataKey::Guardians).unwrap();
         if !guardians.contains(proposer.clone()) {
-            panic!("not a guardian");
+            return Err(Error::Unauthorized);
         }
 
         let id = env
@@ -184,9 +184,11 @@ impl VolatilityShield {
             proposed_at,
         };
 
-        // Emit TimelockStarted event
-        env.events()
-            .publish((symbol_short!("Timelock"),), (id, proposed_at));
+        // Emit TimelockProposed event
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "TimelockProposed"),),
+            (id, proposed_at),
+        );
 
         let threshold: u32 = env
             .storage()
@@ -198,7 +200,7 @@ impl VolatilityShield {
             let res = Self::execute_action(&env, &action, proposed_at);
             if let Err(e) = res {
                 if e != Error::TimelockNotElapsed {
-                    panic!("{:?}", e);
+                    return Err(e);
                 }
             } else {
                 proposal.executed = true;
@@ -215,7 +217,7 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::Proposals, &proposals);
 
-        id
+        Ok(id)
     }
 
     pub fn approve_action(env: Env, guardian: Address, proposal_id: u64) -> Result<(), Error> {
@@ -321,7 +323,8 @@ impl VolatilityShield {
         match action {
             ActionType::SetPaused(state) => {
                 env.storage().instance().set(&DataKey::Paused, state);
-                env.events().publish((symbol_short!("paused"),), state);
+                env.events()
+                    .publish((soroban_sdk::Symbol::new(env, "Paused"),), state);
             }
             ActionType::AddStrategy(strategy) => {
                 Self::internal_add_strategy(env, strategy.clone())?;
@@ -332,7 +335,8 @@ impl VolatilityShield {
         }
 
         // Emit TimelockExecuted event
-        env.events().publish((symbol_short!("TlockExec"),), ());
+        env.events()
+            .publish((soroban_sdk::Symbol::new(env, "TimelockExecuted"),), ());
 
         Ok(())
     }
@@ -444,8 +448,10 @@ impl VolatilityShield {
             .get(&DataKey::MaxDepositPerUser)
             .unwrap_or(i128::MAX);
         if new_user_balance > max_deposit_per_user {
-            env.events()
-                .publish((symbol_short!("Cap"), symbol_short!("deposit")), amount);
+            env.events().publish(
+                (soroban_sdk::Symbol::new(&env, "DepositCapExceeded"),),
+                amount,
+            );
             panic!("DepositCapExceeded: per-user deposit cap exceeded");
         }
 
@@ -458,8 +464,10 @@ impl VolatilityShield {
             .get(&DataKey::MaxTotalAssets)
             .unwrap_or(i128::MAX);
         if new_total_assets > max_total_assets {
-            env.events()
-                .publish((symbol_short!("Cap"), symbol_short!("deposit")), amount);
+            env.events().publish(
+                (soroban_sdk::Symbol::new(&env, "DepositCapExceeded"),),
+                amount,
+            );
             panic!("DepositCapExceeded: global deposit cap exceeded");
         }
         // -------------------------------
@@ -469,14 +477,23 @@ impl VolatilityShield {
             .set(&balance_key, &new_user_balance);
 
         let total_shares = Self::total_shares(&env);
-        Self::set_total_shares(
-            env.clone(),
-            total_shares.checked_add(shares_to_mint).unwrap(),
-        );
-        Self::set_total_assets(env.clone(), total_assets.checked_add(amount).unwrap());
+        let new_total_shares = total_shares.checked_add(shares_to_mint).unwrap();
+        let new_total_assets = total_assets.checked_add(amount).unwrap();
 
-        env.events()
-            .publish((symbol_short!("Deposit"), from.clone()), amount);
+        Self::set_total_shares(env.clone(), new_total_shares);
+        Self::set_total_assets(env.clone(), new_total_assets);
+
+        let share_price = Self::get_share_price(&env);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "Deposit"), from),
+            (
+                amount,
+                share_price,
+                new_total_assets,
+                new_total_shares,
+            ),
+        );
     }
 
     // ── Withdraw ──────────────────────────────
@@ -505,7 +522,7 @@ impl VolatilityShield {
             .unwrap_or(i128::MAX);
         if assets_to_withdraw > max_withdraw_per_tx {
             env.events().publish(
-                (symbol_short!("Cap"), symbol_short!("withdraw")),
+                (soroban_sdk::Symbol::new(&env, "WithdrawCapExceeded"),),
                 assets_to_withdraw,
             );
             panic!("WithdrawalCapExceeded: per-tx withdrawal cap exceeded");
@@ -537,6 +554,21 @@ impl VolatilityShield {
             &(current_balance.checked_sub(shares).unwrap()),
         );
 
+        let total_shares = Self::total_shares(&env);
+        let total_assets = Self::total_assets(&env);
+
+        let new_total_shares = total_shares.checked_sub(shares).unwrap();
+        let new_total_assets = total_assets.checked_sub(assets_to_withdraw).unwrap();
+
+        Self::set_total_shares(env.clone(), new_total_shares);
+        Self::set_total_assets(env.clone(), new_total_assets);
+        env.storage().persistent().set(
+            &balance_key,
+            &(current_balance.checked_sub(shares).unwrap()),
+        );
+
+        let share_price = Self::get_share_price(&env);
+
         let token: Address = env
             .storage()
             .instance()
@@ -548,8 +580,15 @@ impl VolatilityShield {
             &assets_to_withdraw,
         );
 
-        env.events()
-            .publish((symbol_short!("withdraw"), from.clone()), shares);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "Withdraw"), from),
+            (
+                shares,
+                share_price,
+                new_total_assets,
+                new_total_shares,
+            ),
+        );
     }
 
     // ── Withdrawal Queue ───────────────────────
@@ -607,9 +646,14 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::PendingWithdrawals, &pending_withdrawals);
 
-        // Emit WithdrawQueued event
-        env.events()
-            .publish((symbol_short!("WithdrawQ"), from.clone()), shares);
+        let total_assets = Self::total_assets(&env);
+        let total_shares = Self::total_shares(&env);
+        let share_price = Self::get_share_price(&env);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "WithdrawQueued"), from.clone()),
+            (shares, share_price, total_assets, total_shares),
+        );
     }
 
     // ── Withdraw Queue Management ─────────────────────
@@ -622,8 +666,10 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::WithdrawQueueThreshold, &threshold);
-        env.events()
-            .publish((symbol_short!("QueueThr"),), threshold);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "QueueThresholdSet"),),
+            threshold,
+        );
     }
 
     /// Process queued withdrawals (admin only)
@@ -668,8 +714,11 @@ impl VolatilityShield {
             );
 
             env.events().publish(
-                (symbol_short!("WithdrawP"), queued_withdrawal.user.clone()),
-                queued_withdrawal.shares,
+                (
+                    soroban_sdk::Symbol::new(&env, "WithdrawProcessed"),
+                    queued_withdrawal.user.clone(),
+                ),
+                (queued_withdrawal.shares, total_assets, total_shares),
             );
 
             processed += 1;
@@ -725,8 +774,13 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::PendingWithdrawals, &pending_withdrawals);
 
-        env.events()
-            .publish((symbol_short!("WdrwCncl"),), (from, w.shares));
+        let total_assets = Self::total_assets(&env);
+        let total_shares = Self::total_shares(&env);
+
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "WithdrawCancelled"),),
+            (from, w.shares, total_assets, total_shares),
+        );
 
         Ok(())
     }
@@ -773,7 +827,7 @@ impl VolatilityShield {
 
         if now > last_update.checked_add(max_staleness).unwrap_or(u64::MAX) {
             env.events().publish(
-                (soroban_sdk::Symbol::new(&env, "StaleOracleRejected"),),
+                (soroban_sdk::Symbol::new(&env, "OracleStale"),),
                 last_update,
             );
             return Err(Error::StaleOracleData);
@@ -864,6 +918,14 @@ impl VolatilityShield {
                 }
             }
         }
+
+        // Emit VaultSnapshot event
+        let final_total_assets = Self::total_assets(env);
+        let final_total_shares = Self::total_shares(env);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "VaultSnapshot"),),
+            (final_total_assets, final_total_shares, allocations),
+        );
 
         Ok(())
     }
@@ -973,7 +1035,7 @@ impl VolatilityShield {
             .set(&DataKey::Strategies, &strategies);
 
         env.events().publish(
-            (symbol_short!("Strategy"), symbol_short!("added")),
+            (soroban_sdk::Symbol::new(&env, "StrategyAdded"),),
             strategy,
         );
 
@@ -1004,8 +1066,12 @@ impl VolatilityShield {
             );
         }
 
-        env.events()
-            .publish((symbol_short!("harvest"),), total_yield);
+        let total_assets_after = Self::total_assets(&env);
+        let total_shares_after = Self::total_shares(&env);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "Harvest"),),
+            (total_yield, total_assets_after, total_shares_after),
+        );
         Ok(total_yield)
     }
 
@@ -1111,8 +1177,10 @@ impl VolatilityShield {
         env.storage().instance().set(&health_key, &updated_health);
 
         // Emit StrategyFlagged event
-        env.events()
-            .publish((symbol_short!("StrategyF"), strategy.clone()), current_time);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "StrategyFlagged"), strategy.clone()),
+            current_time,
+        );
 
         Ok(())
     }
@@ -1165,9 +1233,11 @@ impl VolatilityShield {
         env.storage().instance().remove(&health_key);
 
         // Emit StrategyRemoved event
+        let total_assets_after = Self::total_assets(&env);
+        let total_shares_after = Self::total_shares(&env);
         env.events().publish(
-            (symbol_short!("StrategyR"), strategy.clone()),
-            strategy_balance,
+            (soroban_sdk::Symbol::new(&env, "StrategyRemoved"), strategy.clone()),
+            (strategy_balance, total_assets_after, total_shares_after),
         );
 
         Ok(())
@@ -1277,6 +1347,19 @@ impl VolatilityShield {
         amount - fee
     }
 
+    pub fn get_share_price(env: &Env) -> i128 {
+        let total_assets = Self::total_assets(env);
+        let total_shares = Self::total_shares(env);
+        if total_shares == 0 {
+            return 1_000_000_000; // 1.0 with 9 decimals
+        }
+        total_assets
+            .checked_mul(1_000_000_000)
+            .unwrap()
+            .checked_div(total_shares)
+            .unwrap()
+    }
+
     pub fn convert_to_shares(env: Env, amount: i128) -> i128 {
         if amount < 0 {
             panic!("negative amount");
@@ -1351,7 +1434,10 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::MaxTotalAssets, &global);
         env.events().publish(
-            (symbol_short!("Caps"), symbol_short!("deposit")),
+            (
+                soroban_sdk::Symbol::new(&env, "CapsSet"),
+                soroban_sdk::Symbol::new(&env, "Deposit"),
+            ),
             (per_user, global),
         );
     }
@@ -1361,8 +1447,13 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::MaxWithdrawPerTx, &per_tx);
-        env.events()
-            .publish((symbol_short!("Caps"), symbol_short!("withdraw")), per_tx);
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(&env, "CapsSet"),
+                soroban_sdk::Symbol::new(&env, "Withdraw"),
+            ),
+            per_tx,
+        );
     }
 
     pub fn set_max_staleness(env: Env, seconds: u64) {
@@ -1377,8 +1468,10 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::TimelockDuration, &duration);
-        env.events()
-            .publish((symbol_short!("TimelockD"),), duration);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "TimelockDurationSet"),),
+            duration,
+        );
     }
 
     pub fn max_staleness(env: &Env) -> u64 {
@@ -1392,8 +1485,10 @@ impl VolatilityShield {
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) {
         Self::require_admin(&env);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
-        env.events()
-            .publish((symbol_short!("upgrade"), symbol_short!("wasm")), ());
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "ContractUpgraded"),),
+            (),
+        );
     }
 
     pub fn migrate(env: Env, new_version: u32) {
@@ -1410,7 +1505,7 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::ContractVersion, &new_version);
         env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("migrate")),
+            (soroban_sdk::Symbol::new(&env, "ContractMigrated"),),
             new_version,
         );
     }

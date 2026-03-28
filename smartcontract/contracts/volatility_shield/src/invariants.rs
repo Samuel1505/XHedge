@@ -31,11 +31,11 @@ proptest! {
     ) {
         let (env, client, _admin, _asset) = setup_test_env();
         let mut total_expected_shares = 0i128;
-        let mut users = core::vec::Vec::new();
+        let mut users = soroban_sdk::Vec::new(&env);
 
         for amount in amounts {
             let user = Address::generate(&env);
-            users.push(user.clone());
+            users.push_back(user.clone());
             client.set_total_assets(&(client.total_assets() + amount));
             let shares = client.convert_to_shares(&amount);
             client.set_balance(&user, &shares);
@@ -47,7 +47,7 @@ proptest! {
         
         // Verify individual balances sum to total_shares
         let mut sum_balances = 0i128;
-        for user in users {
+        for user in users.iter() {
             sum_balances += client.balance(&user);
         }
         assert_eq!(sum_balances, client.total_shares());
