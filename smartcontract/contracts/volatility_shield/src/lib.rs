@@ -66,9 +66,9 @@ pub enum DataKey {
     PendingWithdrawals,
     StrategyHealth(Address),
     TimelockDuration,
-    AcceptedAssets,
-    AssetBalance(Address, Address), // (asset, user)
-    AssetTotalAssets(Address),      // total assets per asset type
+    GovernanceToken,
+    AssetBalance(Address, Address),
+    AssetTotalAssets(Address),
 }
 
 // ─────────────────────────────────────────────
@@ -190,11 +190,9 @@ impl VolatilityShield {
             proposed_at,
         };
 
-        // Emit TimelockProposed event
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "TimelockProposed"),),
-            (id, proposed_at),
-        );
+        // Emit TimelockStarted event
+        env.events()
+            .publish((symbol_short!("Timelock"),), (id, proposed_at));
 
         let threshold: u32 = env
             .storage()
@@ -277,6 +275,31 @@ impl VolatilityShield {
         Ok(())
     }
 
+    pub fn set_governance_token(env: Env, token: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceToken, &token);
+        env.events()
+            .publish((symbol_short!("GovToken"),), token);
+    }
+
+    pub fn get_voting_power(env: Env, user: Address) -> i128 {
+        let gov_token: Option<Address> = env.storage().instance().get(&DataKey::GovernanceToken);
+        if let Some(token_addr) = gov_token {
+            let client = token::Client::new(&env, &token_addr);
+            client.balance(&user)
+        } else {
+            let balance_key = DataKey::Balance(user);
+            env.storage().persistent().get(&balance_key).unwrap_or(0)
+        }
+    }
+
+    pub fn cast_vote(_env: Env, _proposal_id: u64, _support: bool) -> Result<(), Error> {
+        // TODO: Implement cast_vote
+        Ok(())
+    }
+
     /// Add a new guardian to the multisig.
     /// Only the admin can call this.
     pub fn add_guardian(env: Env, guardian: Address) -> Result<(), Error> {
@@ -333,92 +356,6 @@ impl VolatilityShield {
         Ok(())
     }
 
-    // ── Multi-Asset Management ────────────────
-    /// Add a new accepted asset to the vault.
-    /// Only admin can call this function.
-    pub fn add_accepted_asset(env: Env, asset: Address) -> Result<(), Error> {
-        Self::require_admin(&env);
-        let mut accepted_assets: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AcceptedAssets)
-            .unwrap_or(Vec::new(&env));
-
-        // Check if asset already exists
-        if accepted_assets.contains(asset.clone()) {
-            return Ok(()); // Asset already accepted, no-op
-        }
-
-        accepted_assets.push_back(asset.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::AcceptedAssets, &accepted_assets);
-
-        // Initialize per-asset total for the new asset
-        env.storage()
-            .instance()
-            .set(&DataKey::AssetTotalAssets(asset.clone()), &0_i128);
-
-        env.events().publish((symbol_short!("AddAsset"),), asset);
-
-        Ok(())
-    }
-
-    /// Get the list of accepted assets.
-    pub fn get_accepted_assets(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::AcceptedAssets)
-            .unwrap_or(Vec::new(&env))
-    }
-
-    /// Check if an asset is accepted.
-    pub fn is_accepted_asset(env: Env, asset: Address) -> bool {
-        let accepted_assets: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AcceptedAssets)
-            .unwrap_or(Vec::new(&env));
-        accepted_assets.contains(asset)
-    }
-
-    /// Get the balance of a user in a specific asset.
-    pub fn get_asset_balance(env: Env, asset: Address, user: Address) -> i128 {
-        let asset_balance_key = DataKey::AssetBalance(asset, user);
-        env.storage()
-            .persistent()
-            .get(&asset_balance_key)
-            .unwrap_or(0)
-    }
-
-    /// Get the total assets deposited in a specific asset type.
-    pub fn get_asset_total(env: Env, asset: Address) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::AssetTotalAssets(asset))
-            .unwrap_or(0)
-    }
-
-    /// Get all per-asset totals (useful for multi-asset share price calculation).
-    pub fn get_all_asset_totals(env: Env) -> Vec<(Address, i128)> {
-        let accepted_assets: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AcceptedAssets)
-            .unwrap_or(Vec::new(&env));
-
-        let mut totals: Vec<(Address, i128)> = Vec::new(&env);
-        for asset in accepted_assets {
-            let total = env
-                .storage()
-                .instance()
-                .get(&DataKey::AssetTotalAssets(asset.clone()))
-                .unwrap_or(0);
-            totals.push_back((asset, total));
-        }
-        totals
-    }
-
     fn execute_action(env: &Env, action: &ActionType, proposed_at: u64) -> Result<(), Error> {
         // Check if timelock has elapsed
         Self::assert_timelock_elapsed(env, proposed_at)?;
@@ -437,8 +374,7 @@ impl VolatilityShield {
         }
 
         // Emit TimelockExecuted event
-        env.events()
-            .publish((soroban_sdk::Symbol::new(env, "TimelockExecuted"),), ());
+        env.events().publish((symbol_short!("TlockExec"),), ());
 
         Ok(())
     }
@@ -456,7 +392,7 @@ impl VolatilityShield {
         }
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(proposed_at);
+        let elapsed = now.checked_sub(proposed_at).unwrap_or(0);
 
         if elapsed < timelock_duration {
             return Err(Error::TimelockNotElapsed);
@@ -533,17 +469,10 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::Threshold, &threshold);
 
-        // Multi-asset initialization: accept the primary asset by default
-        let mut accepted_assets = Vec::new(&env);
-        accepted_assets.push_back(asset.clone());
+        // Initialize contract version
         env.storage()
             .instance()
-            .set(&DataKey::AcceptedAssets, &accepted_assets);
-
-        // Initialize per-asset total for the primary asset
-        env.storage()
-            .instance()
-            .set(&DataKey::AssetTotalAssets(asset), &0_i128);
+            .set(&DataKey::ContractVersion, &1u32);
 
         Ok(())
     }
@@ -743,6 +672,7 @@ impl VolatilityShield {
         );
     }
 
+    // ── Withdrawal Queue ───────────────────────
     /// Queue a withdrawal request for processing later.
     ///
     /// This is called automatically by withdraw() when the amount exceeds the threshold.
@@ -829,10 +759,8 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::WithdrawQueueThreshold, &threshold);
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "QueueThresholdSet"),),
-            threshold,
-        );
+        env.events()
+            .publish((symbol_short!("QueueThr"),), threshold);
     }
 
     /// Process a batch of queued withdrawals.
@@ -881,11 +809,8 @@ impl VolatilityShield {
             );
 
             env.events().publish(
-                (
-                    soroban_sdk::Symbol::new(&env, "WithdrawProcessed"),
-                    queued_withdrawal.user.clone(),
-                ),
-                (queued_withdrawal.shares, total_assets, total_shares),
+                (symbol_short!("WithdrawP"), queued_withdrawal.user.clone()),
+                queued_withdrawal.shares,
             );
 
             processed += 1;
@@ -943,13 +868,8 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::PendingWithdrawals, &pending_withdrawals);
 
-        let total_assets = Self::total_assets(&env);
-        let total_shares = Self::total_shares(&env);
-
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "WithdrawCancelled"),),
-            (from, w.shares, total_assets, total_shares),
-        );
+        env.events()
+            .publish((symbol_short!("WdrwCncl"),), (from, w.shares));
 
         Ok(())
     }
@@ -1282,11 +1202,11 @@ impl VolatilityShield {
             let strategy = StrategyClient::new(&env, strategy_addr.clone());
             let actual_balance = strategy.balance();
 
-            // Get expected balance from allocations (BPS -> Absolute)
+            // Get expected balance from allocations
             let bps_allocation = expected_allocations.get(strategy_addr.clone()).unwrap_or(0);
             let expected_balance = total_assets
                 .checked_mul(bps_allocation)
-                .unwrap()
+                .unwrap_or(0)
                 .checked_div(10_000)
                 .unwrap_or(0);
 
@@ -1361,13 +1281,8 @@ impl VolatilityShield {
         env.storage().instance().set(&health_key, &updated_health);
 
         // Emit StrategyFlagged event
-        env.events().publish(
-            (
-                soroban_sdk::Symbol::new(&env, "StrategyFlagged"),
-                strategy.clone(),
-            ),
-            current_time,
-        );
+        env.events()
+            .publish((symbol_short!("StrategyF"), strategy.clone()), current_time);
 
         Ok(())
     }
@@ -1403,6 +1318,13 @@ impl VolatilityShield {
                 &env.current_contract_address(),
                 &strategy_balance,
             );
+
+            // Update total assets to reflect returned funds
+            let current_assets = Self::total_assets(&env);
+            Self::set_total_assets(
+                env.clone(),
+                current_assets.checked_add(strategy_balance).unwrap(),
+            );
         }
 
         // Remove from strategies list
@@ -1416,14 +1338,9 @@ impl VolatilityShield {
         env.storage().instance().remove(&health_key);
 
         // Emit StrategyRemoved event
-        let total_assets_after = Self::total_assets(&env);
-        let total_shares_after = Self::total_shares(&env);
         env.events().publish(
-            (
-                soroban_sdk::Symbol::new(&env, "StrategyRemoved"),
-                strategy.clone(),
-            ),
-            (strategy_balance, total_assets_after, total_shares_after),
+            (symbol_short!("StrategyR"), strategy.clone()),
+            strategy_balance,
         );
 
         Ok(())
@@ -1479,6 +1396,11 @@ impl VolatilityShield {
             .instance()
             .get(&DataKey::Asset)
             .expect("Not initialized")
+    }
+
+    /// Check if the asset is an accepted underlying asset.
+    pub fn is_accepted_asset(env: Env, asset: Address) -> bool {
+        asset == Self::get_asset(&env)
     }
 
     /// Get the list of all registered strategy addresses.
@@ -1664,10 +1586,8 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::TimelockDuration, &duration);
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "TimelockDurationSet"),),
-            duration,
-        );
+        env.events()
+            .publish((symbol_short!("TimelockD"),), duration);
     }
 
     pub fn max_staleness(env: &Env) -> u64 {
@@ -1682,7 +1602,7 @@ impl VolatilityShield {
         Self::require_admin(&env);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         env.events()
-            .publish((soroban_sdk::Symbol::new(&env, "ContractUpgraded"),), ());
+            .publish((symbol_short!("upgrade"), symbol_short!("wasm")), ());
     }
 
     pub fn migrate(env: Env, new_version: u32) {
@@ -1699,7 +1619,7 @@ impl VolatilityShield {
             .instance()
             .set(&DataKey::ContractVersion, &new_version);
         env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "ContractMigrated"),),
+            (symbol_short!("upgrade"), symbol_short!("migrate")),
             new_version,
         );
     }
