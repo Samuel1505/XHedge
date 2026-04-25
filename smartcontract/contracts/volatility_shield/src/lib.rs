@@ -154,6 +154,44 @@ impl<'a> StrategyClient<'a> {
 // Contract
 // ─────────────────────────────────────────────
 
+/// Snapshot of vault global state returned by `get_vault_summary`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VaultSummary {
+    pub total_assets: i128,
+    pub total_shares: i128,
+    pub share_price: i128,
+    pub paused: bool,
+    pub oracle_last_update: u64,
+}
+
+/// Snapshot of a user's vault position returned by `get_user_summary`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct UserSummary {
+    pub balance: i128,
+    pub queued_shares: i128,
+    pub voting_power: i128,
+}
+
+/// Snapshot of governance configuration returned by `get_governance_summary`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GovernanceSummary {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+    pub active_proposal_count: u32,
+}
+
+/// Per-strategy entry returned by `get_strategy_summary`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StrategyEntry {
+    pub strategy: Address,
+    pub last_known_balance: i128,
+    pub is_healthy: bool,
+}
+
 #[contract]
 pub struct VolatilityShield;
 
@@ -312,10 +350,12 @@ impl VolatilityShield {
         if guardians.contains(guardian.clone()) {
             return Ok(());
         }
-        guardians.push_back(guardian);
+        guardians.push_back(guardian.clone());
         env.storage()
             .instance()
             .set(&DataKey::Guardians, &guardians);
+        env.events()
+            .publish((symbol_short!("GuardAdd"), guardian), ());
         Ok(())
     }
 
@@ -329,12 +369,14 @@ impl VolatilityShield {
             .get(&DataKey::Guardians)
             .unwrap_or(Vec::new(&env));
         let index = guardians
-            .first_index_of(guardian)
+            .first_index_of(guardian.clone())
             .ok_or(Error::Unauthorized)?;
         guardians.remove(index);
         env.storage()
             .instance()
             .set(&DataKey::Guardians, &guardians);
+        env.events()
+            .publish((symbol_short!("GuardRm"), guardian), ());
         Ok(())
     }
 
@@ -353,6 +395,8 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        env.events()
+            .publish((symbol_short!("Threshold"),), threshold);
         Ok(())
     }
 
@@ -687,15 +731,23 @@ impl VolatilityShield {
         Self::internal_queue_withdraw(env, from, shares);
     }
 
-        Self::internal_queue_withdraw(env, from, shares);
-    }
-
     fn internal_queue_withdraw(env: Env, from: Address, shares: i128) {
         let balance_key = DataKey::Balance(from.clone());
         let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
 
         if current_balance < shares {
             panic!("insufficient shares for withdrawal");
+        }
+
+        // Reject if the user already has a pending queued withdrawal.
+        let existing: Vec<QueuedWithdrawal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWithdrawals)
+            .unwrap_or(Vec::new(&env));
+        let already_queued = existing.iter().any(|w| w.user == from);
+        if already_queued {
+            panic!("user already has a pending withdrawal");
         }
 
         let assets_to_withdraw = Self::convert_to_assets(env.clone(), shares);
@@ -1576,6 +1628,8 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::MaxStaleness, &seconds);
+        env.events()
+            .publish((symbol_short!("Staleness"),), seconds);
     }
 
     pub fn set_timelock_duration(env: Env, duration: u64) {
@@ -1685,6 +1739,118 @@ impl VolatilityShield {
             // In Soroban the host simply verifies whichever has an auth entry.
             admin.require_auth();
         }
+    }
+
+    // ── Structured view/query functions for off-chain consumers (SC-31) ────
+
+    /// Returns a single-call snapshot of the vault's global state.
+    ///
+    /// Designed for indexers and dashboards that need to minimise RPC calls.
+    /// Does not mutate any storage.
+    pub fn get_vault_summary(env: Env) -> VaultSummary {
+        let total_assets = Self::total_assets(&env);
+        let total_shares = Self::total_shares(&env);
+        let share_price = Self::get_share_price(&env);
+        let paused = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        let oracle_last_update: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleLastUpdate)
+            .unwrap_or(0);
+        VaultSummary {
+            total_assets,
+            total_shares,
+            share_price,
+            paused,
+            oracle_last_update,
+        }
+    }
+
+    /// Returns a single-call snapshot of a specific user's position in the vault.
+    ///
+    /// Includes balance, queued withdrawal (if any), and current voting power.
+    /// Does not mutate any storage.
+    pub fn get_user_summary(env: Env, user: Address) -> UserSummary {
+        let balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(user.clone()))
+            .unwrap_or(0);
+
+        let pending: Vec<QueuedWithdrawal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWithdrawals)
+            .unwrap_or(Vec::new(&env));
+        let queued_shares: i128 = pending
+            .iter()
+            .find(|w| w.user == user)
+            .map(|w| w.shares)
+            .unwrap_or(0);
+
+        let voting_power = Self::get_voting_power(env.clone(), user);
+        UserSummary {
+            balance,
+            queued_shares,
+            voting_power,
+        }
+    }
+
+    /// Returns a single-call snapshot of the vault's governance configuration.
+    ///
+    /// Includes guardians, approval threshold, and the count of active proposals.
+    /// Does not mutate any storage.
+    pub fn get_governance_summary(env: Env) -> GovernanceSummary {
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Guardians)
+            .unwrap_or(Vec::new(&env));
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(0);
+        let proposals: Vec<Proposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposals)
+            .unwrap_or(Vec::new(&env));
+        let active_proposal_count = proposals.iter().filter(|p| !p.executed).count() as u32;
+        GovernanceSummary {
+            guardians,
+            threshold,
+            active_proposal_count,
+        }
+    }
+
+    /// Returns a single-call snapshot of all registered strategies and their health.
+    ///
+    /// Each entry contains the strategy address, its health status (if recorded),
+    /// and its last-known balance. Does not mutate any storage.
+    pub fn get_strategy_summary(env: Env) -> Vec<StrategyEntry> {
+        let strategies = Self::get_strategies(&env);
+        let mut entries = Vec::new(&env);
+        for strategy in strategies.iter() {
+            let health: Option<StrategyHealth> = env
+                .storage()
+                .instance()
+                .get(&DataKey::StrategyHealth(strategy.clone()));
+            let (last_known_balance, is_healthy) = match health {
+                Some(h) => (h.last_known_balance, h.is_healthy),
+                None => (0, true),
+            };
+            entries.push_back(StrategyEntry {
+                strategy,
+                last_known_balance,
+                is_healthy,
+            });
+        }
+        entries
     }
 }
 
