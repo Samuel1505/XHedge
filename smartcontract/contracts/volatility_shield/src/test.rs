@@ -532,7 +532,6 @@ mod strategy_health_tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_flag_nonexistent_strategy() {
         let env = Env::default();
         env.mock_all_auths();
@@ -627,7 +626,6 @@ mod strategy_health_tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_remove_nonexistent_strategy() {
         let env = Env::default();
         env.mock_all_auths();
@@ -666,9 +664,10 @@ mod strategy_health_tests {
         client.set_timelock_duration(&0u64);
         client.propose_action(&admin, &ActionType::AddStrategy(mock_strategy_id.clone()));
 
-        // Initially health is None before first check
+        // AddStrategy initialises health with is_healthy = true
         let health = client.get_strategy_health(&mock_strategy_id);
-        assert!(health.is_none());
+        assert!(health.is_some());
+        assert!(health.unwrap().is_healthy);
 
         // After flagging, should be unhealthy
         client.flag_strategy(&mock_strategy_id);
@@ -678,7 +677,6 @@ mod strategy_health_tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_check_health_no_strategies() {
         let env = Env::default();
         env.mock_all_auths();
@@ -693,7 +691,7 @@ mod strategy_health_tests {
         let guardians = soroban_sdk::vec![&env, admin.clone()];
         client.init(&admin, &asset, &oracle, &treasury, &0u32, &guardians, &1u32);
 
-        // Try to check health with no strategies — should return NoStrategies error
+        // With no strategies registered, check_strategy_health returns NoStrategies error.
         let result = client.try_check_strategy_health();
         assert_eq!(result, Err(Ok(Error::NoStrategies)));
     }
