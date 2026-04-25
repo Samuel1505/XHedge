@@ -553,7 +553,6 @@ mod strategy_health_tests {
     }
 
     #[test]
-    #[ignore] // mock_strategy does not hold real tokens; remove_strategy's token transfer requires actual token balance
     fn test_remove_strategy_with_funds() {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
@@ -574,24 +573,29 @@ mod strategy_health_tests {
         );
 
         let (mock_strategy_id, mock_client) = create_mock_strategy(&env);
+
+        // Initialise the mock strategy in real-token mode so withdraw()
+        // transfers tokens back to the vault contract.
+        mock_client.init(&contract_id, &token_id);
+
         client.propose_action(&admin, &ActionType::AddStrategy(mock_strategy_id.clone()));
 
-        // Mint tokens directly to strategy so vault can pull them back
+        // Mint tokens directly to strategy and record the balance internally.
         stellar_asset_client.mint(&mock_strategy_id, &1000);
         mock_client.deposit(&1000);
 
-        // Remove strategy
+        // Remove strategy — should withdraw all funds back to vault.
         client.remove_strategy(&mock_strategy_id);
 
-        // Strategy should be removed from list
+        // Strategy should be removed from list.
         let strategies = client.get_strategies();
         assert!(!strategies.contains(&mock_strategy_id));
 
-        // All funds should be back in vault
+        // All funds should be back in vault.
         assert_eq!(mock_client.balance(), 0);
         assert_eq!(token_client.balance(&contract_id), 1000);
 
-        // Health data should be cleaned up
+        // Health data should be cleaned up.
         let health = client.get_strategy_health(&mock_strategy_id);
         assert!(health.is_none());
     }
@@ -1051,7 +1055,6 @@ fn test_cancel_withdraw() {
 }
 
 #[test]
-#[ignore] // TODO: contract design mismatch with upstream; needs investigation
 #[should_panic(expected = "user already has a pending withdrawal")]
 fn test_cannot_queue_multiple_withdrawals() {
     let env = Env::default();
@@ -1523,7 +1526,7 @@ fn test_queue_withdraw_prevents_double_spending() {
 
     let user = Address::generate(&env);
     stellar_asset_client.mint(&user, &1000);
-    client.deposit(&user, &1000);
+    client.deposit(&user, &token_id, &1000);
 
     // Set threshold so 600 triggers queue
     client.set_withdraw_queue_threshold(&500);
@@ -1558,7 +1561,7 @@ fn test_cancel_queued_withdrawal_restores_balance() {
 
     let user = Address::generate(&env);
     stellar_asset_client.mint(&user, &1000);
-    client.deposit(&user, &1000);
+    client.deposit(&user, &token_id, &1000);
 
     client.set_withdraw_queue_threshold(&500);
     client.withdraw(&user, &600);
@@ -1610,7 +1613,7 @@ fn test_deposit_while_paused_fails() {
 
     client.set_paused(&true);
     let user = Address::generate(&env);
-    client.deposit(&user, &100);
+    client.deposit(&user, &asset, &100);
 }
 
 #[test]
@@ -1627,7 +1630,7 @@ fn test_deposit_zero_fails() {
     let guardians = soroban_sdk::vec![&env, admin.clone()];
     client.init(&admin, &asset, &oracle, &treasury, &0u32, &guardians, &1u32);
 
-    client.deposit(&Address::generate(&env), &0);
+    client.deposit(&Address::generate(&env), &asset, &0);
 }
 
 #[test]
