@@ -4,6 +4,9 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+const DEFAULT_PROPOSAL_TTL_LEDGERS: u32 = 518_400;
+const SHARE_PRICE_HISTORY_CAP: u32 = 365;
+
 // ─────────────────────────────────────────────
 // Error types
 // ─────────────────────────────────────────────
@@ -127,7 +130,9 @@ pub enum DataKey {
     Guardians,
     Threshold,
     Proposals,
+    ProposalIds,
     NextProposalId,
+    ProposalTtlLedgers,
     WithdrawQueueThreshold,
     PendingWithdrawals,
     StrategyHealth(Address),
@@ -181,6 +186,7 @@ pub struct Proposal {
     pub action: ActionType,
     pub approvals: Vec<Address>,
     pub executed: bool,
+    pub executed_ledger: u32,
     pub proposed_at: u64,
 }
 
@@ -369,6 +375,8 @@ impl VolatilityShield {
             return Self::emit_and_err(&env, Error::Unauthorized);
         }
 
+        Self::prune_old_proposals_internal(&env);
+
         let id = env
             .storage()
             .instance()
@@ -383,8 +391,9 @@ impl VolatilityShield {
             id,
             proposer: proposer.clone(),
             action: action.clone(),
-            approvals: soroban_sdk::vec![&env, proposer],
+            approvals: soroban_sdk::vec![&env, proposer.clone()],
             executed: false,
+            executed_ledger: 0,
             proposed_at,
         };
 
@@ -399,13 +408,14 @@ impl VolatilityShield {
             .unwrap_or(1);
         if threshold <= 1 {
             // Try to execute, but if timelock hasn't elapsed, the proposal will remain unexecuted
-            let res = Self::execute_action(&env, &action, proposed_at);
+            let res = Self::execute_action(&env, &proposer, &action, proposed_at);
             if let Err(e) = res {
                 if e != Error::TimelockNotElapsed {
                     return Err(e);
                 }
             } else {
                 proposal.executed = true;
+                proposal.executed_ledger = env.ledger().sequence();
             }
         }
 
@@ -418,6 +428,15 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::Proposals, &proposals);
+        let mut proposal_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalIds)
+            .unwrap_or(Vec::new(&env));
+        proposal_ids.push_back(id);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalIds, &proposal_ids);
 
         Ok(id)
     }
@@ -439,6 +458,8 @@ impl VolatilityShield {
             return Self::emit_and_err(&env, Error::Unauthorized);
         }
 
+        Self::prune_old_proposals_internal(&env);
+
         let mut proposals: Map<u64, Proposal> = env
             .storage()
             .instance()
@@ -454,7 +475,7 @@ impl VolatilityShield {
             return Self::emit_and_err(&env, Error::AlreadyApproved);
         }
 
-        proposal.approvals.push_back(guardian);
+        proposal.approvals.push_back(guardian.clone());
 
         // Emit ProposalApproved event
         env.events().publish((soroban_sdk::Symbol::new(&env, "ProposalApproved"), proposal_id), guardian);
@@ -465,8 +486,9 @@ impl VolatilityShield {
             .get(&DataKey::Threshold)
             .unwrap_or(1);
         if proposal.approvals.len() >= threshold {
-            Self::execute_action(&env, &proposal.action, proposal.proposed_at)?;
+            Self::execute_action(&env, &guardian, &proposal.action, proposal.proposed_at)?;
             proposal.executed = true;
+            proposal.executed_ledger = env.ledger().sequence();
         }
 
         proposals.set(proposal_id, proposal);
@@ -611,7 +633,12 @@ impl VolatilityShield {
         Ok(())
     }
 
-    fn execute_action(env: &Env, action: &ActionType, proposed_at: u64) -> Result<(), Error> {
+    fn execute_action(
+        env: &Env,
+        caller: &Address,
+        action: &ActionType,
+        proposed_at: u64,
+    ) -> Result<(), Error> {
         // Check if timelock has elapsed
         Self::assert_timelock_elapsed(env, proposed_at)?;
         match action {
@@ -706,6 +733,9 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::Proposals, &Map::<u64, Proposal>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalIds, &Vec::<u64>::new(&env));
         env.storage()
             .instance()
             .set(&DataKey::TimelockDuration, &0_u64);
@@ -1709,6 +1739,7 @@ impl VolatilityShield {
             (soroban_sdk::Symbol::new(&env, "VaultSnapshot"),),
             (final_total_assets, final_total_shares, allocations),
         );
+        Self::record_share_price_snapshot(env);
 
         Ok(())
     }
@@ -1998,6 +2029,7 @@ impl VolatilityShield {
 
         let total_assets_after = Self::total_assets(&env);
         let total_shares_after = Self::total_shares(&env);
+        Self::record_share_price_snapshot(&env);
         env.events().publish(
             (soroban_sdk::Symbol::new(&env, "Harvest"),),
             (total_yield, total_assets_after, total_shares_after),
@@ -2717,6 +2749,67 @@ impl VolatilityShield {
             .unwrap_or(1)
     }
 
+    pub fn set_proposal_ttl_ledgers(env: Env, ledgers: u32) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalTtlLedgers, &ledgers);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "ProposalTtlLedgers"),),
+            ledgers,
+        );
+    }
+
+    pub fn get_proposal_ttl_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalTtlLedgers)
+            .unwrap_or(DEFAULT_PROPOSAL_TTL_LEDGERS)
+    }
+
+    pub fn prune_old_proposals(env: Env) -> u32 {
+        Self::require_admin(&env);
+        Self::prune_old_proposals_internal(&env)
+    }
+
+    pub fn list_proposals(env: Env, offset: u32, limit: u32) -> Vec<Proposal> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let proposal_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalIds)
+            .unwrap_or(Vec::new(&env));
+        let proposals: Map<u64, Proposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposals)
+            .unwrap_or(Map::new(&env));
+
+        let mut listed = Vec::new(&env);
+        let end = offset.saturating_add(limit);
+        let mut index = offset;
+        while index < proposal_ids.len() && index < end {
+            let proposal_id = proposal_ids.get(index).unwrap();
+            if let Some(proposal) = proposals.get(proposal_id) {
+                listed.push_back(proposal);
+            }
+            index += 1;
+        }
+        listed
+    }
+
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
+        let proposals: Map<u64, Proposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposals)
+            .unwrap_or(Map::new(&env));
+        proposals.get(proposal_id)
+    }
+
     // ── Internal Helpers ──────────────────────
     pub fn take_fees(env: &Env, amount: i128) -> i128 {
         let fee_pct = Self::fee_percentage(&env);
@@ -2800,6 +2893,97 @@ impl VolatilityShield {
         let admin = Self::read_admin(env);
         admin.require_auth();
         admin
+    }
+
+    fn proposal_ttl_ledgers(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalTtlLedgers)
+            .unwrap_or(DEFAULT_PROPOSAL_TTL_LEDGERS)
+    }
+
+    fn prune_old_proposals_internal(env: &Env) -> u32 {
+        let mut proposals: Map<u64, Proposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposals)
+            .unwrap_or(Map::new(env));
+        let proposal_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalIds)
+            .unwrap_or(Vec::new(env));
+        let ttl = Self::proposal_ttl_ledgers(env);
+        let current_ledger = env.ledger().sequence();
+        let mut retained_ids = Vec::new(env);
+        let mut pruned = 0_u32;
+
+        for proposal_id in proposal_ids.iter() {
+            if let Some(proposal) = proposals.get(proposal_id) {
+                let expired = proposal.executed
+                    && proposal.executed_ledger > 0
+                    && current_ledger.saturating_sub(proposal.executed_ledger) >= ttl;
+                if expired {
+                    proposals.remove(proposal_id);
+                    pruned = pruned.saturating_add(1);
+                } else {
+                    retained_ids.push_back(proposal_id);
+                }
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposals, &proposals);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalIds, &retained_ids);
+
+        if pruned > 0 {
+            env.events()
+                .publish((soroban_sdk::Symbol::new(env, "ProposalsPruned"),), pruned);
+        }
+
+        pruned
+    }
+
+    fn record_pause_change(env: &Env, caller: Address, state: bool) {
+        env.storage().instance().set(&DataKey::Paused, &state);
+        let timestamp = env.ledger().timestamp();
+        let mut history: Vec<(u64, Address, bool)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseHistory)
+            .unwrap_or(Vec::new(env));
+        history.push_back((timestamp, caller.clone(), state));
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistory, &history);
+
+        let event_name = if state {
+            "VaultPaused"
+        } else {
+            "VaultUnpaused"
+        };
+        env.events().publish(
+            (soroban_sdk::Symbol::new(env, event_name),),
+            (caller, timestamp),
+        );
+    }
+
+    fn record_share_price_snapshot(env: &Env) {
+        let mut history: Vec<(u64, i128)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SharePriceHistory)
+            .unwrap_or(Vec::new(env));
+        if history.len() >= SHARE_PRICE_HISTORY_CAP {
+            history.remove(0);
+        }
+        history.push_back((env.ledger().timestamp(), Self::get_share_price(env)));
+        env.storage()
+            .instance()
+            .set(&DataKey::SharePriceHistory, &history);
     }
 
     // ── Emergency Pause ──────────────────────────
@@ -3163,12 +3347,24 @@ impl VolatilityShield {
             .instance()
             .get(&DataKey::Threshold)
             .unwrap_or(0);
-        let proposals: Vec<Proposal> = env
+        let proposal_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalIds)
+            .unwrap_or(Vec::new(&env));
+        let proposals: Map<u64, Proposal> = env
             .storage()
             .instance()
             .get(&DataKey::Proposals)
-            .unwrap_or(Vec::new(&env));
-        let active_proposal_count = proposals.iter().filter(|p| !p.executed).count() as u32;
+            .unwrap_or(Map::new(&env));
+        let mut active_proposal_count = 0_u32;
+        for proposal_id in proposal_ids.iter() {
+            if let Some(proposal) = proposals.get(proposal_id) {
+                if !proposal.executed {
+                    active_proposal_count = active_proposal_count.saturating_add(1);
+                }
+            }
+        }
         GovernanceSummary {
             guardians,
             threshold,
