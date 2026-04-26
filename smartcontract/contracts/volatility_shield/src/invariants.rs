@@ -102,10 +102,11 @@ proptest! {
 
         assert_eq!(client.total_shares(), shares);
 
-        client.withdraw(&user, &user, &shares, &None::<i128>);
+        client.withdraw(&user, &user, &token_id, &shares);
         assert_eq!(client.balance(&user), 0);
         assert_eq!(client.total_shares(), 0);
-    }
+        }
+
 
     // 1. Guardian threshold is always <= guardian count
     // This invariant ensures we cannot set a threshold requiring more signatures than available guardians.
@@ -147,7 +148,7 @@ proptest! {
         for &s in deposit_shares.iter() {
             let u = Address::generate(&env);
             client.set_balance(&u, &s);
-            let _ = client.try_queue_withdraw(&u, &u, &s);
+            let _ = client.try_queue_withdraw(&u, &u, &_asset, &s);
         }
 
         let mut queued = 0;

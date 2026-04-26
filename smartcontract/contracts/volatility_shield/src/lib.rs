@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Map,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Map,
     Symbol, Vec,
 };
 
@@ -152,8 +152,12 @@ pub enum DataKey {
     AllowlistMode,
     Blocklist,
     Allowlist,
-    MaxConsecutiveFailures,
+    SharePriceHistory,
+    PauseHistory,
     SupportedAssets,
+    Delegate(Address),
+    VoteRecord(u64, Address),
+    VoteTally(u64),
 }
 
 #[contracttype]
@@ -390,7 +394,6 @@ pub struct YieldHistory {
 #[contract]
 pub struct VolatilityShield;
 
-#[contractimpl]
 impl VolatilityShield {
     fn emit_error(env: &Env, error: Error) {
         env.events()
@@ -400,11 +403,6 @@ impl VolatilityShield {
     fn emit_and_err<T>(env: &Env, error: Error) -> Result<T, Error> {
         Self::emit_error(env, error);
         Err(error)
-    fn emit_slippage_protection_triggered(env: &Env, expected_min: i128, actual: i128) {
-        env.events().publish(
-            (soroban_sdk::Symbol::new(env, "SlippageProtectionTriggered"),),
-            (expected_min, actual),
-        );
     }
 
     pub fn enter_guard(env: &Env) {
@@ -424,6 +422,10 @@ impl VolatilityShield {
     pub fn exit_guard(env: &Env) {
         env.storage().instance().remove(&DataKey::ReentrancyGuard);
     }
+}
+
+#[contractimpl]
+impl VolatilityShield {
 
     /// Propose a new governance action.
     ///
@@ -544,7 +546,7 @@ impl VolatilityShield {
         proposal.approvals.push_back(guardian.clone());
 
         // Emit ProposalApproved event
-        env.events().publish((soroban_sdk::Symbol::new(&env, "ProposalApproved"), proposal_id), guardian);
+        env.events().publish((soroban_sdk::Symbol::new(&env, "ProposalApproved"), proposal_id), guardian.clone());
 
         let threshold: u32 = env
             .storage()
@@ -701,7 +703,7 @@ impl VolatilityShield {
 
     fn execute_action(
         env: &Env,
-        caller: &Address,
+        _caller: &Address,
         action: &ActionType,
         proposed_at: u64,
     ) -> Result<(), Error> {
@@ -709,8 +711,7 @@ impl VolatilityShield {
         Self::assert_timelock_elapsed(env, proposed_at)?;
         match action {
             ActionType::SetPaused(state) => {
-                env.storage().instance().set(&DataKey::Paused, state);
-                env.events().publish((symbol_short!("Paused"),), state);
+                Self::record_pause_change(env, env.current_contract_address(), *state);
             }
             ActionType::AddStrategy(strategy) => {
                 Self::internal_add_strategy(env, strategy.clone())?;
@@ -844,6 +845,22 @@ impl VolatilityShield {
         Ok(())
     }
 
+    /// Returns the share price history snapshots for the vault.
+    pub fn get_share_price_history(env: Env) -> Vec<(u64, i128)> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SharePriceHistory)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns the pause/unpause history for the vault.
+    pub fn get_pause_history(env: Env) -> Vec<(u64, Address, bool)> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PauseHistory)
+            .unwrap_or(Vec::new(&env))
+    }
+
     // ── Deposit ───────────────────────────────
     /// Deposit assets into the vault.
     /// If asset is not the default/primary asset, it must be in the accepted assets list.
@@ -862,7 +879,7 @@ impl VolatilityShield {
         from: Address,
         asset: Address,
         amount: i128,
-        min_shares_out: Option<i128>,
+        _min_shares_out: Option<i128>,
     ) -> Result<(), Error> {
         let _guard = Guard::new(&env);
         Self::check_version(&env, 1);
@@ -879,17 +896,24 @@ impl VolatilityShield {
         }
 
         // Verify asset is accepted
-        if !Self::is_supported_asset(&env, &asset) {
-            panic!("asset not accepted");
+        if !Self::is_supported_asset(env.clone(), asset.clone()) {
+            panic!("unsupported asset");
         }
 
-        let price = Self::get_asset_price(&env, &asset);
+        let price = Self::get_asset_price(env.clone(), asset.clone());
         let value_deposited = amount.checked_mul(price).unwrap().checked_div(1_000_000_000).unwrap();
 
         // Transfer the asset from user to contract
         token::Client::new(&env, &asset).transfer(&from, &env.current_contract_address(), &amount);
 
         let shares_to_mint = Self::convert_to_shares(env.clone(), value_deposited);
+
+        // Slippage check
+        if let Some(min_shares) = min_shares_out {
+            if shares_to_mint < min_shares {
+                panic!("SlippageExceeded: expected min {}, actual {}", min_shares, shares_to_mint);
+            }
+        }
 
         // Track per-asset user balance
         let asset_balance_key = DataKey::AssetBalance(asset.clone(), from.clone());
@@ -1010,7 +1034,7 @@ impl VolatilityShield {
                 continue;
             }
 
-            if !Self::is_supported_asset(&env, asset) {
+            if !Self::is_supported_asset(env.clone(), asset.clone()) {
                 env.events().publish(
                     (symbol_short!("BatchDep"), symbol_short!("Fail")),
                     (
@@ -1024,7 +1048,7 @@ impl VolatilityShield {
                 continue;
             }
 
-            let price = Self::get_asset_price(&env, asset);
+            let price = Self::get_asset_price(env.clone(), asset.clone());
             let value_deposited = amount.checked_mul(price).unwrap().checked_div(1_000_000_000).unwrap();
             let shares_to_mint = Self::convert_to_shares(env.clone(), value_deposited);
 
@@ -1130,14 +1154,14 @@ impl VolatilityShield {
     /// @param from The address of the user withdrawing.
     /// @param asset The address of the asset to withdraw.
     /// @param shares The amount of shares to burn.
-    pub fn withdraw(env: Env, from: Address, asset: Address, shares: i128) {
+    pub fn withdraw(env: Env, caller: Address, from: Address, asset: Address, shares: i128) -> Result<(), Error> {
         let _guard = Guard::new(&env);
         Self::check_version(&env, 1);
         Self::assert_not_paused(&env);
         if shares <= 0 {
             panic!("shares to withdraw must be positive");
         }
-        Self::require_owner_or_delegate(&env, &from, &caller)?;
+        Self::require_owner_or_delegate(&env, &from, &caller);
 
         let balance_key = DataKey::Balance(from.clone());
         let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
@@ -1146,12 +1170,12 @@ impl VolatilityShield {
             panic!("insufficient shares for withdrawal");
         }
 
-        if !Self::is_supported_asset(&env, &asset) {
+        if !Self::is_supported_asset(env.clone(), asset.clone()) {
             panic!("unsupported asset");
         }
 
         let assets_to_withdraw_value = Self::convert_to_assets(env.clone(), shares);
-        let asset_price = Self::get_asset_price(&env, &asset);
+        let asset_price = Self::get_asset_price(env.clone(), asset.clone());
         let token_units_to_withdraw = assets_to_withdraw_value
             .checked_mul(1_000_000_000)
             .unwrap()
@@ -1182,7 +1206,7 @@ impl VolatilityShield {
         if assets_to_withdraw_value > queue_threshold {
             // Queue the withdrawal instead of processing immediately
             Self::internal_queue_withdraw(env.clone(), from, asset, shares);
-            return;
+            return Ok(());
         }
 
         let total_shares = Self::total_shares(&env);
@@ -1253,7 +1277,7 @@ impl VolatilityShield {
                 continue;
             }
 
-            if !Self::is_supported_asset(&env, asset) {
+            if !Self::is_supported_asset(env.clone(), asset.clone()) {
                 env.events().publish(
                     (symbol_short!("BatchWd"), symbol_short!("Fail")),
                     (from.clone(), shares, symbol_short!("BadAsset")),
@@ -1275,7 +1299,7 @@ impl VolatilityShield {
             }
 
             let assets_to_withdraw_value = Self::convert_to_assets(env.clone(), shares);
-            let asset_price = Self::get_asset_price(&env, asset);
+            let asset_price = Self::get_asset_price(env.clone(), asset.clone());
             let token_units_to_withdraw = assets_to_withdraw_value
                 .checked_mul(1_000_000_000)
                 .unwrap()
@@ -1421,13 +1445,13 @@ impl VolatilityShield {
     /// @param from The address of the user withdrawing.
     /// @param asset The address of the asset being withdrawn.
     /// @param shares The amount of shares to burn.
-    pub fn queue_withdraw(env: Env, from: Address, asset: Address, shares: i128) {
+    pub fn queue_withdraw(env: Env, caller: Address, from: Address, asset: Address, shares: i128) {
         let _guard = Guard::new(&env);
         Self::assert_not_paused(&env);
         if shares <= 0 {
             panic!("shares to queue must be positive");
         }
-        from.require_auth();
+        Self::require_owner_or_delegate(&env, &from, &caller);
         Self::internal_queue_withdraw(env.clone(), from, asset, shares);
     }
 
@@ -2174,7 +2198,7 @@ impl VolatilityShield {
             return Self::emit_and_err(&env, Error::NoStrategies);
         }
 
-        let max_failures: u32 = env
+        let _max_failures: u32 = env
             .storage()
             .instance()
             .get(&DataKey::MaxConsecutiveFailures)
@@ -2262,39 +2286,21 @@ impl VolatilityShield {
                 || consecutive_failures != current_health.consecutive_failures
                 || actual_balance != current_health.last_known_balance
             {
-                let new_health = StrategyHealth {
+                current_health = StrategyHealth {
                     last_known_balance: actual_balance,
                     last_check_timestamp: current_time,
                     is_healthy,
                     consecutive_failures,
                 };
-                env.storage().instance().set(&health_key, &new_health);
+                env.storage().instance().set(&health_key, &current_health);
             }
 
+            if !is_healthy {
                 unhealthy_strategies.push_back(strategy_addr.clone());
-            } else {
-                // ── Successful check: reset strike counter ───────────────
-                current_health.consecutive_failures = 0;
             }
-
-            // Always refresh balance and timestamp
-            current_health.last_known_balance = actual_balance;
-            current_health.last_check_timestamp = current_time;
-
-            env.storage().instance().set(&health_key, &current_health);
         }
 
         Ok(unhealthy_strategies)
-    }
-
-    /// Set the maximum number of consecutive failures before auto-flagging a strategy.
-    pub fn set_max_consecutive_failures(env: Env, threshold: u32) {
-        Self::require_admin(&env);
-        env.storage()
-            .instance()
-            .set(&DataKey::MaxConsecutiveFailures, &threshold);
-        env.events()
-            .publish((symbol_short!("MaxFail"),), threshold);
     }
 
     /// Manually flag a strategy as unhealthy.
@@ -2545,7 +2551,7 @@ impl VolatilityShield {
         let mut total_value: i128 = 0;
         for asset in supported.iter() {
             let asset_quantity: i128 = env.storage().instance().get(&DataKey::AssetTotalAssets(asset.clone())).unwrap_or(0);
-            let price = Self::get_asset_price(env, &asset);
+            let price = Self::get_asset_price(env.clone(), asset.clone());
             let value = asset_quantity.checked_mul(price).unwrap_or(0).checked_div(1_000_000_000).unwrap_or(0);
             total_value = total_value.checked_add(value).unwrap_or(total_value);
         }
@@ -2581,12 +2587,15 @@ impl VolatilityShield {
         asset == Self::get_asset(&env)
     }
 
-    fn get_asset_price(env: &Env, asset: &Address) -> i128 {
-        let oracle = Self::get_oracle(env);
+    pub fn get_asset_price(env: Env, asset: Address) -> i128 {
+        if asset == Self::get_asset(&env) {
+            return 1_000_000_000;
+        }
+        let oracle = Self::get_oracle(&env);
         env.invoke_contract::<i128>(
             &oracle,
-            &soroban_sdk::Symbol::new(env, "price"),
-            soroban_sdk::vec![env, asset.clone()],
+            &soroban_sdk::Symbol::new(&env, "price"),
+            soroban_sdk::vec![&env, asset.into_val(&env)],
         )
     }
 
@@ -2608,13 +2617,13 @@ impl VolatilityShield {
         }
     }
 
-    pub fn is_supported_asset(env: &Env, asset: &Address) -> bool {
+    pub fn is_supported_asset(env: Env, asset: Address) -> bool {
         let supported: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::SupportedAssets)
-            .unwrap_or(Vec::new(env));
-        supported.contains(asset.clone())
+            .unwrap_or(Vec::new(&env));
+        supported.contains(asset)
     }
 
     /// Get the list of all registered strategy addresses.
@@ -3112,9 +3121,9 @@ impl VolatilityShield {
 
     // ── Emergency Pause ──────────────────────────
     pub fn set_paused(env: Env, state: bool) {
-        Self::require_admin(&env);
-        env.storage().instance().set(&DataKey::Paused, &state);
-        env.events().publish((symbol_short!("Paused"),), state);
+        let admin = Self::read_admin(&env);
+        admin.require_auth();
+        Self::record_pause_change(&env, admin, state);
     }
 
     pub fn emergency_shutdown(env: Env, admin: Address) {
@@ -3131,11 +3140,8 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyShutdown, &true);
-
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "EmergencyShutdownActivated"),),
-            (admin, env.ledger().timestamp()),
-        );
+        
+        Self::record_pause_change(&env, admin, true);
     }
 
     pub fn emergency_withdraw(env: Env, from: Address) {
@@ -3380,11 +3386,11 @@ impl VolatilityShield {
         env: &Env,
         owner: &Address,
         caller: &Address,
-    ) -> Result<(), Error> {
+    ) {
         caller.require_auth();
 
         if caller == owner {
-            return Ok(());
+            return;
         }
 
         match env
@@ -3392,8 +3398,8 @@ impl VolatilityShield {
             .persistent()
             .get::<DataKey, Address>(&DataKey::Delegate(owner.clone()))
         {
-            Some(delegate) if delegate == *caller => Ok(()),
-            _ => Err(Error::Unauthorized),
+            Some(delegate) if delegate == *caller => (),
+            _ => panic!("unauthorized: caller is neither owner nor delegate"),
         }
     }
 
