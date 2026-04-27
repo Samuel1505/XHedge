@@ -1,3 +1,22 @@
+<<<<<<< HEAD
+import { 
+  Horizon, 
+  Networks, 
+  TransactionBuilder, 
+  Operation,
+  Address,
+  nativeToScVal,
+  xdr,
+  Contract,
+  rpc,
+  SorobanDataBuilder,
+  SorobanAuthorizationEntry
+} from "@stellar/stellar-sdk";
+
+const RPC_URLS: Record<string, string> = {
+  PUBLIC: "https://horizon.stellar.org",
+  TESTNET: "https://horizon-testnet.stellar.org",
+=======
 import {
   Horizon,
   Networks,
@@ -28,6 +47,7 @@ const SOROBAN_RPC_URLS: Record<NetworkType, string> = {
   [NetworkType.MAINNET]: "https://rpc.mainnet.stellar.org",
   [NetworkType.TESTNET]: "https://rpc.testnet.stellar.org",
   [NetworkType.FUTURENET]: "https://rpc-futurenet.stellar.org",
+>>>>>>> upstream/main
 };
 
 export interface VaultMetrics {
@@ -44,6 +64,15 @@ export interface VaultData {
   totalShares: string;
 }
 
+<<<<<<< HEAD
+const NETWORK_PASSPHRASE: Record<string, string> = {
+  PUBLIC: Networks.PUBLIC,
+  TESTNET: Networks.TESTNET,
+  FUTURENET: "Test SDF Future Network ; October 2022",
+};
+
+export type NetworkType = "futurenet" | "testnet" | "mainnet";
+=======
 const NETWORK_PASSPHRASE: Record<NetworkType, string> = {
   [NetworkType.MAINNET]: Networks.PUBLIC,
   [NetworkType.TESTNET]: Networks.TESTNET,
@@ -53,10 +82,17 @@ const NETWORK_PASSPHRASE: Record<NetworkType, string> = {
 export function getNetworkPassphrase(network: NetworkType): string {
   return NETWORK_PASSPHRASE[network];
 }
+>>>>>>> upstream/main
 
 export async function fetchVaultData(
   contractId: string,
   userAddress: string | null,
+<<<<<<< HEAD
+  network: "PUBLIC" | "TESTNET"
+): Promise<VaultMetrics> {
+  try {
+    return {
+=======
   network: NetworkType
 ): Promise<VaultMetrics> {
   try {
@@ -130,6 +166,7 @@ export async function fetchVaultData(
     console.error("Error fetching vault data from contract:", error);
     // Fallback to mock data for development if contract call fails
     const mockData: VaultMetrics = {
+>>>>>>> upstream/main
       totalAssets: "10000000000",
       totalShares: "10000000000",
       sharePrice: "1.0000000",
@@ -137,6 +174,32 @@ export async function fetchVaultData(
       userShares: userAddress ? "1000000000" : "0",
       assetSymbol: "USDC",
     };
+<<<<<<< HEAD
+  } catch {
+    return {
+      totalAssets: "0",
+      totalShares: "0",
+      sharePrice: "0",
+      userBalance: "0",
+      userShares: "0",
+      assetSymbol: "USDC",
+    };
+  }
+}
+
+export function calculateSharePrice(totalAssets: string, totalShares: string): string {
+  const assets = BigInt(totalAssets || "0");
+  const shares = BigInt(totalShares || "0");
+  
+  if (shares === BigInt(0)) {
+    return "1.0000000";
+  }
+  
+  const pricePerShare = (assets * BigInt(1e7)) / shares;
+  const price = Number(pricePerShare) / 1e7;
+  
+  return price.toFixed(7);
+=======
     return mockData;
   }
 }
@@ -192,6 +255,7 @@ export function calculateSharePrice(totalAssets: string, totalShares: string): s
   const price = Number(pricePerShare) / 1e9;
 
   return price.toFixed(9);
+>>>>>>> upstream/main
 }
 
 export function convertStroopsToDisplay(stroops: string): string {
@@ -200,6 +264,8 @@ export function convertStroopsToDisplay(stroops: string): string {
   return display.toFixed(7);
 }
 
+<<<<<<< HEAD
+=======
 export interface Transaction {
   id: string;
   type: "deposit" | "withdraw";
@@ -283,10 +349,30 @@ export async function fetchTransactionHistory(
   }
 }
 
+>>>>>>> upstream/main
 export async function buildDepositXdr(
   contractId: string,
   userAddress: string,
   amount: string,
+<<<<<<< HEAD
+  network: NetworkType = "testnet"
+): Promise<string> {
+  const source = await Horizon.AccountRequest.fetch(
+    RPC_URLS[network.toUpperCase()] || RPC_URLS.TESTNET,
+    userAddress
+  );
+
+  const passphrase = network === "mainnet" 
+    ? Networks.PUBLIC 
+    : network === "futurenet" 
+      ? NETWORK_PASSPHRASE.FUTURENET 
+      : Networks.TESTNET;
+
+  const contract = new Contract(contractId);
+  
+  const amountBigInt = BigInt(Math.floor(parseFloat(amount) * 1e7)).toString();
+  
+=======
   network: NetworkType = NetworkType.TESTNET
 ): Promise<string> {
   const horizonUrl = RPC_URLS[network];
@@ -299,6 +385,7 @@ export async function buildDepositXdr(
 
   const amountBigInt = BigInt(Math.floor(parseFloat(amount) * 1e7)).toString();
 
+>>>>>>> upstream/main
   const depositParams = [
     new Address(userAddress).toScVal(),
     nativeToScVal(amountBigInt, { type: "i128" })
@@ -319,6 +406,25 @@ export async function buildWithdrawXdr(
   contractId: string,
   userAddress: string,
   shares: string,
+<<<<<<< HEAD
+  network: NetworkType = "testnet"
+): Promise<string> {
+  const source = await Horizon.AccountRequest.fetch(
+    RPC_URLS[network.toUpperCase()] || RPC_URLS.TESTNET,
+    userAddress
+  );
+
+  const passphrase = network === "mainnet" 
+    ? Networks.PUBLIC 
+    : network === "futurenet" 
+      ? NETWORK_PASSPHRASE.FUTURENET 
+      : Networks.TESTNET;
+
+  const contract = new Contract(contractId);
+  
+  const sharesBigInt = BigInt(Math.floor(parseFloat(shares) * 1e7)).toString();
+  
+=======
   network: NetworkType = NetworkType.TESTNET
 ): Promise<string> {
   const horizonUrl = RPC_URLS[network];
@@ -331,6 +437,7 @@ export async function buildWithdrawXdr(
 
   const sharesBigInt = BigInt(Math.floor(parseFloat(shares) * 1e7)).toString();
 
+>>>>>>> upstream/main
   const withdrawParams = [
     new Address(userAddress).toScVal(),
     nativeToScVal(sharesBigInt, { type: "i128" })
@@ -349,6 +456,38 @@ export async function buildWithdrawXdr(
 
 export async function simulateAndAssembleTransaction(
   xdrString: string,
+<<<<<<< HEAD
+  network: NetworkType = "testnet"
+): Promise<{ result: string | null; error: string | null }> {
+  try {
+    const rpcUrl = network === "mainnet" 
+      ? "https://rpc.mainnet.stellar.org"
+      : network === "futurenet"
+        ? "https://rpc-futurenet.stellar.org"
+        : "https://rpc.testnet.stellar.org";
+    
+    const server = new rpc.Server(rpcUrl);
+    const passphrase = network === "mainnet" 
+      ? Networks.PUBLIC 
+      : network === "futurenet" 
+        ? NETWORK_PASSPHRASE.FUTURENET 
+        : Networks.TESTNET;
+
+    const transaction = rpc.TransactionBuilder.fromXDR(xdrString, passphrase);
+    
+    const simulated = await server.simulateTransaction(transaction);
+    
+    if (rpc.SimulateTransactionResult.isSimulationSuccess(simulated)) {
+      const assembled = await server.assembleTransaction(transaction, simulated);
+      return { result: assembled.transaction.toXDR(), error: null };
+    }
+    
+    return { result: null, error: "Simulation failed" };
+  } catch (error) {
+    return { 
+      result: null, 
+      error: error instanceof Error ? error.message : "Failed to assemble transaction" 
+=======
   network: NetworkType = NetworkType.TESTNET
 ): Promise<{ result: string | null; error: string | null }> {
   try {
@@ -409,12 +548,49 @@ export async function estimateTransactionFee(
     return {
       fee: null,
       error: error instanceof Error ? error.message : "Failed to estimate fee"
+>>>>>>> upstream/main
     };
   }
 }
 
 export async function submitTransaction(
   signedXdr: string,
+<<<<<<< HEAD
+  network: NetworkType = "testnet"
+): Promise<{ hash: string | null; error: string | null }> {
+  try {
+    const rpcUrl = network === "mainnet" 
+      ? "https://rpc.mainnet.stellar.org"
+      : network === "futurenet"
+        ? "https://rpc-futurenet.stellar.org"
+        : "https://rpc.testnet.stellar.org";
+    
+    const server = new rpc.Server(rpcUrl);
+    
+    const transaction = rpc.TransactionBuilder.fromXDR(
+      signedXdr,
+      network === "mainnet" 
+        ? Networks.PUBLIC 
+        : network === "futurenet" 
+          ? NETWORK_PASSPHRASE.FUTURENET 
+          : Networks.TESTNET
+    );
+    
+    const response = await server.sendTransaction(transaction);
+    
+    if (response.status === "PENDING" || response.status === "SUCCESS") {
+      return { hash: response.hash, error: null };
+    }
+    
+    return { hash: null, error: response.status };
+  } catch (error) {
+    return { 
+      hash: null, 
+      error: error instanceof Error ? error.message : "Failed to submit transaction" 
+    };
+  }
+}
+=======
   network: NetworkType = NetworkType.TESTNET
 ): Promise<{ hash: string | null; error: string | null }> {
   try {
@@ -1051,3 +1227,4 @@ export async function fetchHistoricalSharePriceWithFallback(
     return [];
   }
 }
+>>>>>>> upstream/main

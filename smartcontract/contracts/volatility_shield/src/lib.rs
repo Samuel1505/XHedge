@@ -10,7 +10,6 @@ const BALANCE_TTL_THRESHOLD: u32 = DEFAULT_PROPOSAL_TTL_LEDGERS;
 const BALANCE_TTL_BUMP: u32 = BALANCE_TTL_THRESHOLD + DAY_IN_LEDGERS;
 const DEFAULT_PROPOSAL_TTL_SECONDS: u64 = 2_592_000; // 30 days = 518,400 * 5s
 const SHARE_PRICE_HISTORY_CAP: u32 = 365;
-
 // ─────────────────────────────────────────────
 // Error types
 // ─────────────────────────────────────────────
@@ -70,6 +69,10 @@ pub enum Error {
     CircuitBreakerActive = 25,
     /// Operation is blocked because emergency shutdown mode is active.
     EmergencyShutdownActive = 26,
+    /// Invalid fee percentage (must be <= 10,000 bps).
+    InvalidFeePercentage = 30,
+    /// Arithmetic overflow occurred.
+    ArithmeticOverflow = 31,
 }
 
 impl Error {
@@ -102,6 +105,8 @@ impl Error {
             Error::UserBlocked => Symbol::new(env, "user_blocked"),
             Error::CircuitBreakerActive => Symbol::new(env, "circuit_breaker_active"),
             Error::EmergencyShutdownActive => Symbol::new(env, "emergency_shutdown_active"),
+            Error::InvalidFeePercentage => Symbol::new(env, "invalid_fee_pct"),
+            Error::ArithmeticOverflow => Symbol::new(env, "arith_overflow"),
         }
     }
 }
@@ -235,7 +240,6 @@ pub struct Proposal {
     pub proposed_at: u64,
 }
 
-// ─────────────────────────────────────────────
 // Strategy health struct
 // ─────────────────────────────────────────────
 #[contracttype]
@@ -254,7 +258,6 @@ pub struct VoteTally {
     pub yes_votes: i128,
     pub no_votes: i128,
 }
-
 pub struct StrategyClient<'a> {
     env: &'a Env,
     address: Address,
@@ -284,7 +287,6 @@ impl<'a> StrategyClient<'a> {
             _ => Err(soroban_sdk::String::from_str(self.env, "deposit failed")),
         }
     }
-
     pub fn withdraw(&self, amount: i128) {
         self.env.invoke_contract::<()>(
             &self.address,
@@ -304,7 +306,6 @@ impl<'a> StrategyClient<'a> {
             _ => Err(soroban_sdk::String::from_str(self.env, "withdraw failed")),
         }
     }
-
     pub fn balance(&self) -> i128 {
         self.env.invoke_contract::<i128>(
             &self.address,
@@ -312,7 +313,6 @@ impl<'a> StrategyClient<'a> {
             soroban_sdk::vec![self.env],
         )
     }
-
     pub fn try_balance(&self) -> Result<i128, soroban_sdk::String> {
         let res = self.env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &self.address,
@@ -348,7 +348,7 @@ impl<'a> Drop for Guard<'a> {
 // Contract
 // ─────────────────────────────────────────────
 
-/// Snapshot of vault global state returned by `get_vault_summary`.
+// Snapshot of vault global state returned by `get_vault_summary`
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct VaultSummary {
@@ -862,17 +862,6 @@ impl VolatilityShield {
     }
 
     // ── Initialization ────────────────────────
-    /// Initialize the contract state.
-    ///
-    /// This function can only be called once.
-    /// @param admin The address with administrative privileges.
-    /// @param asset The address of the asset being managed (e.g., USDC).
-    /// @param oracle The address of the oracle provider.
-    /// @param treasury The address where fees are collected.
-    /// @param fee_percentage The management fee in basis points (1/10000).
-    /// @param guardians A list of addresses for the multisig governance.
-    /// @param threshold The number of approvals required for governance actions.
-    #[allow(clippy::too_many_arguments)]
     pub fn init(
         env: Env,
         admin: Address,
@@ -892,6 +881,9 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::Strategies, &Vec::<Address>::new(&env));
+        if fee_percentage > 10000 {
+            return Err(Error::InvalidFeePercentage);
+        }
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage()
             .instance()
@@ -941,11 +933,6 @@ impl VolatilityShield {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
-
-        // Initialize contract version
-        env.storage()
-            .instance()
-            .set(&DataKey::ContractVersion, &1u32);
 
         Self::bump_instance_ttl(&env);
 
@@ -1273,6 +1260,7 @@ impl VolatilityShield {
         if shares <= 0 {
             panic!("shares to withdraw must be positive");
         }
+
         Self::require_owner_or_delegate(&env, &from, &caller)?;
 
         let current_balance = Self::read_user_balance(&env, &from);
@@ -2171,16 +2159,8 @@ impl VolatilityShield {
             .expect("arithmetic overflow in rebalance delta")
     }
 
-    // ── Strategy Management ───────────────────
-    /// Internal: add a strategy after it has passed the multi-sig proposal flow.
-    ///
-    /// This function is ONLY reachable via `execute_action(ActionType::AddStrategy(...))`,
-    /// which itself requires a guardian proposal + threshold approvals + timelock.
-    /// Direct admin calls are intentionally not possible — the two-step governance
-    /// approval is the sole entry point, satisfying the whitelist requirement.
     fn internal_add_strategy(env: &Env, strategy: Address) -> Result<(), Error> {
         Self::check_version(env, 1);
-        // No require_admin here — access is enforced by the proposal/approval flow above.
 
         let mut strategies: Vec<Address> = env
             .storage()
@@ -2207,6 +2187,71 @@ impl VolatilityShield {
 
         env.events()
             .publish((soroban_sdk::Symbol::new(&env, "StrategyAdded"),), strategy);
+
+        Ok(())
+    }
+
+    pub fn set_fee_pct(env: Env, fee_percentage: u32) -> Result<(), Error> {
+        let admin = Self::read_admin(&env);
+        admin.require_auth();
+
+        if fee_percentage > 10000 {
+            return Err(Error::InvalidFeePercentage);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FeePercentage, &fee_percentage);
+        
+        env.events().publish(
+            (symbol_short!("fee_pct"), symbol_short!("updated")),
+            fee_percentage,
+        );
+
+        Ok(())
+    }
+
+    pub fn remove_strategy(env: Env, strategy: Address, force_remove: bool) -> Result<(), Error> {
+        let admin = Self::read_admin(&env);
+        admin.require_auth();
+
+        let mut strategies: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Strategies)
+            .unwrap_or(Vec::new(&env));
+        
+        let index = strategies.first_index_of(strategy.clone());
+        if index.is_none() {
+            return Err(Error::NoStrategies);
+        }
+
+        if !force_remove {
+            let strategy_client = StrategyClient::new(&env, strategy.clone());
+            match strategy_client.try_balance() {
+                Ok(balance) => {
+                    if balance > 0 {
+                        panic!("Strategy still has funds. Use rebalance first or force_remove=true");
+                    }
+                }
+                _ => {
+                    env.events().publish(
+                        (symbol_short!("Strategy"), symbol_short!("fail_bal")),
+                        strategy.clone(),
+                    );
+                }
+            }
+        }
+
+        strategies.remove(index.unwrap());
+        env.storage()
+            .instance()
+            .set(&DataKey::Strategies, &strategies);
+
+        env.events().publish(
+            (symbol_short!("Strategy"), symbol_short!("removed")),
+            strategy,
+        );
 
         Ok(())
     }
@@ -2325,10 +2370,11 @@ impl VolatilityShield {
         }
 
         if total_yield > 0 {
+            let fee_adjusted_yield = Self::take_fees(&env, total_yield)?;
             let current_assets = Self::total_assets(&env);
             Self::set_total_assets(
                 env.clone(),
-                current_assets.checked_add(total_yield).unwrap(),
+                current_assets.checked_add(fee_adjusted_yield).ok_or(Error::ArithmeticOverflow)?,
             );
         }
 
@@ -2521,58 +2567,6 @@ impl VolatilityShield {
     }
 
     /// Remove a strategy from the vault and withdraw all funds from it.
-    ///
-    /// Only the admin can call this.
-    /// @param strategy The address of the strategy to remove.
-    pub fn remove_strategy(env: Env, strategy: Address) -> Result<(), Error> {
-        Self::require_admin(&env);
-
-        // Verify strategy exists
-        let mut strategies = Self::get_strategies(&env);
-        let strategy_index = strategies.iter().position(|s| s == strategy);
-
-        if strategy_index.is_none() {
-            return Self::emit_and_err(&env, Error::NotInitialized);
-        }
-
-        // Withdraw all funds from strategy first
-        let strategy_client = StrategyClient::new(&env, strategy.clone());
-        let strategy_balance = strategy_client.balance();
-
-        if strategy_balance > 0 {
-            // Transfer all funds back to vault
-            let asset_addr = Self::get_asset(&env);
-            let _token_client = token::Client::new(&env, &asset_addr);
-
-            // Withdraw from strategy
-            strategy_client.withdraw(strategy_balance);
-
-            // Update total assets to reflect returned funds
-            let current_assets = Self::total_assets(&env);
-            Self::set_total_assets(
-                env.clone(),
-                current_assets.checked_add(strategy_balance).unwrap(),
-            );
-        }
-
-        // Remove from strategies list
-        strategies.remove(strategy_index.unwrap() as u32);
-        env.storage()
-            .instance()
-            .set(&DataKey::Strategies, &strategies);
-
-        // Clean up health data
-        let health_key = DataKey::StrategyHealth(strategy.clone());
-        env.storage().instance().remove(&health_key);
-
-        // Emit StrategyRemoved event
-        env.events().publish(
-            (symbol_short!("StrategyR"), strategy.clone()),
-            strategy_balance,
-        );
-
-        Ok(())
-    }
 
     /// Get health information for a specific strategy.
     pub fn get_strategy_health(env: Env, strategy: Address) -> Option<StrategyHealth> {
@@ -2743,7 +2737,6 @@ impl VolatilityShield {
         total_value
     }
 
-    /// Get the total number of vault shares in circulation.
     pub fn total_shares(env: &Env) -> i128 {
         env.storage()
             .instance()
@@ -3047,6 +3040,35 @@ impl VolatilityShield {
         Self::read_user_balance(&env, &user)
     }
 
+    // ── Internal Helpers ──────────────────────
+    pub fn take_fees(env: &Env, amount: i128) -> Result<i128, Error> {
+        let fee_pct = Self::fee_percentage(&env);
+        if fee_pct == 0 {
+            return Ok(amount);
+        }
+        let fee = amount
+            .checked_mul(fee_pct as i128)
+            .ok_or(Error::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::ArithmeticOverflow)?;
+        
+        if fee > 0 {
+            let treasury = Self::treasury(env);
+            let token = Self::get_asset(env);
+            token::Client::new(env, &token).transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &fee,
+            );
+            env.events().publish(
+                (symbol_short!("fee_col"), treasury),
+                fee,
+            );
+        }
+
+        Ok(amount.checked_sub(fee).ok_or(Error::ArithmeticOverflow)?)
+    }
+
     /// Get the list of all guardians in the multisig governance.
     pub fn get_guardians(env: Env) -> Vec<Address> {
         env.storage()
@@ -3147,20 +3169,6 @@ impl VolatilityShield {
             .get(&DataKey::Proposals)
             .unwrap_or(Map::new(&env));
         proposals.get(proposal_id)
-    }
-
-    // ── Internal Helpers ──────────────────────
-    pub fn take_fees(env: &Env, amount: i128) -> i128 {
-        let fee_pct = Self::fee_percentage(&env);
-        if fee_pct == 0 {
-            return amount;
-        }
-        let fee = amount
-            .checked_mul(fee_pct as i128)
-            .unwrap()
-            .checked_div(10000)
-            .unwrap();
-        amount - fee
     }
 
     pub fn get_share_price(env: &Env) -> i128 {
@@ -3539,7 +3547,6 @@ impl VolatilityShield {
     pub fn is_emergency_shutdown(env: Env) -> bool {
         Self::emergency_shutdown_active(&env)
     }
-
     fn assert_not_paused(env: &Env) {
         if env
             .storage()
